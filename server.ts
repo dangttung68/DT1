@@ -1501,6 +1501,7 @@ app.get('/api/project/update-bundle', async (_req, res) => {
       'metadata.json',
       'firebase-applet-config.json',
       'Dockerfile',
+      '.env.example',
       'public/app-icon.jpg',
     ];
 
@@ -1519,11 +1520,26 @@ app.get('/api/project/update-bundle', async (_req, res) => {
       filesToPack.add(rel);
     }
 
-    for (const rel of filesToPack) {
+    const sortedFiles = Array.from(filesToPack).sort();
+    for (const rel of sortedFiles) {
       const abs = path.join(rootDir, rel);
       const buf = await fs.promises.readFile(abs);
       zip.file(rel, buf);
     }
+
+    zip.file(
+      'UPDATE_MANIFEST.json',
+      JSON.stringify(
+        {
+          app: 'Pydroid 3 Web',
+          generatedAt: new Date().toISOString(),
+          fileCount: sortedFiles.length,
+          files: sortedFiles,
+        },
+        null,
+        2
+      )
+    );
 
     const zipBuffer = await zip.generateAsync({
       type: 'nodebuffer',

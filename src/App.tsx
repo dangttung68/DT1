@@ -73,6 +73,7 @@ import {
   saveActiveFileOverwrite,
   downloadPyFileToDevice,
   pickPyFileWithHandle,
+  pickNativeDocumentForEdit,
   readFileFromDefaultFolder,
   saveShortcutsConfigToDefaultFolder,
   loadShortcutsConfigFromDefaultFolder,
@@ -413,12 +414,12 @@ function MainIDEApp() {
 
   // Pre-cache imported packages when user switches to a different file or sample code while Pyodide is ready
   useEffect(() => {
-    if (pyodideWarmState !== 'ready' || !activeFile?.content) return;
+    if (pyodideWarmState !== 'ready' || isRunning || !activeFile?.content) return;
     const timer = setTimeout(() => {
       void prewarmCodeDependencies(activeFile.content);
-    }, 450);
+    }, 550);
     return () => clearTimeout(timer);
-  }, [activeFileId, activeFile?.content, pyodideWarmState]);
+  }, [activeFileId, activeFile?.content, pyodideWarmState, isRunning]);
 
   // Sync installed package list from CPython server when Pip modal opens in CPython mode
   useEffect(() => {
@@ -535,19 +536,25 @@ function MainIDEApp() {
       content: activeFile.content,
       fileHandle,
       devicePath: activeFile.devicePath,
+      nativeUri: activeFile.nativeUri,
     });
 
-    const updatedFiles = files.map((f) =>
-      f.id === activeFile.id
-        ? {
-            ...f,
-            isModified: false,
-            devicePath: res.devicePath || f.devicePath,
-          }
-        : f
-    );
-    setFiles(updatedFiles);
-    localStorage.setItem('pydroid_files', JSON.stringify(updatedFiles));
+    if (res.ok) {
+      const updatedFiles = files.map((f) =>
+        f.id === activeFile.id
+          ? {
+              ...f,
+              isModified: false,
+              devicePath: res.devicePath || f.devicePath,
+              nativeUri: res.nativeUri || f.nativeUri,
+            }
+          : f
+      );
+      setFiles(updatedFiles);
+      try {
+        localStorage.setItem('pydroid_files', JSON.stringify(updatedFiles));
+      } catch {}
+    }
 
     if (!res.ok) {
       const errMsg = res.error || `Không thể ghi đè ${activeFile.name}`;
@@ -557,7 +564,7 @@ function MainIDEApp() {
 
     const msg =
       res.method === 'local'
-        ? `Đã Save ${activeFile.name} vào bộ nhớ ứng dụng (chưa mở file trực tiếp từ ổ đĩa).`
+        ? `Đã Save ${activeFile.name} vào bộ nhớ ứng dụng.`
         : `Đã Save (ghi đè) ${activeFile.name} → ${res.displayPath}`;
     showToast(msg);
     return { ok: true, message: msg };
@@ -591,11 +598,15 @@ function MainIDEApp() {
     fileName: string,
     content: string,
     devicePath?: string,
-    fileHandle?: any
+    fileHandle?: any,
+    nativeUri?: string
   ) => {
     const targetDevicePath = devicePath || `${getDefaultFolderPath()}/${fileName}`;
     const existing = files.find(
-      (f) => f.devicePath === targetDevicePath || (f.name === fileName && f.sourceType === 'phone')
+      (f) =>
+        (nativeUri && f.nativeUri === nativeUri) ||
+        f.devicePath === targetDevicePath ||
+        (f.name === fileName && f.sourceType === 'phone')
     );
     if (existing) {
       if (fileHandle) {
@@ -611,6 +622,7 @@ function MainIDEApp() {
                 isModified: false,
                 sourceType: 'phone',
                 devicePath: targetDevicePath,
+                nativeUri: nativeUri ?? f.nativeUri,
               }
             : f
         )
@@ -628,6 +640,7 @@ function MainIDEApp() {
         isModified: false,
         sourceType: 'phone',
         devicePath: targetDevicePath,
+        nativeUri,
       };
       setFiles((prev) => [...prev, newFile]);
       setActiveFileId(newId);
@@ -644,6 +657,26 @@ function MainIDEApp() {
     openPhoneFileInEditor(res.name, res.content || '', undefined, res.fileHandle);
     showToast(`Đã mở ${res.name} (nhấn Save để ghi đè trực tiếp file này)`);
     return true;
+  };
+
+  const handlePickPyNative = async (): Promise<{
+    handled: boolean;
+    opened: boolean;
+    error?: string;
+  }> => {
+    const res = await pickNativeDocumentForEdit();
+    if (!res.supported) {
+      return { handled: false, opened: false };
+    }
+    if (res.cancelled) {
+      return { handled: true, opened: false };
+    }
+    if (res.error || !res.name) {
+      return { handled: true, opened: false, error: res.error || 'Không thể mở tệp đã chọn' };
+    }
+    openPhoneFileInEditor(res.name, res.content || '', undefined, undefined, res.uri);
+    showToast(`Đã mở ${res.name} (nhấn Save để ghi đè trực tiếp file trên điện thoại)`);
+    return { handled: true, opened: true };
   };
 
   const handleOpenFromDefaultFolder = async (
@@ -931,10 +964,28 @@ function MainIDEApp() {
     }
 
     const prefix = preservedOutputPrefixRef.current;
-    let currentStdout = '';
-    let currentStderr = '';
+    const currentStdoutChunks: string[] = [];
+    const currentStderrChunks: string[] = [];
+    let currentStdoutCache = '';
+    let currentStderrCache = '';
     let flushScheduled = false;
     let flushRafId: number | null = null;
+
+    const getCurrentStdout = () => {
+      if (currentStdoutChunks.length > 0) {
+        currentStdoutCache += currentStdoutChunks.join('');
+        currentStdoutChunks.length = 0;
+      }
+      return currentStdoutCache;
+    };
+
+    const getCurrentStderr = () => {
+      if (currentStderrChunks.length > 0) {
+        currentStderrCache += currentStderrChunks.join('');
+        currentStderrChunks.length = 0;
+      }
+      return currentStderrCache;
+    };
 
     const mergeRunResult = (nextRes: ExecutionResult): ExecutionResult => {
       const cleanNextStderr =
@@ -954,14 +1005,16 @@ function MainIDEApp() {
     const flushPendingOutput = () => {
       flushScheduled = false;
       flushRafId = null;
+      const liveStdout = getCurrentStdout();
+      const liveStderr = getCurrentStderr();
       const mergedStderr =
-        prefix.stderr && currentStderr
-          ? `${prefix.stderr}\n---\n${currentStderr}`
-          : currentStderr || prefix.stderr;
+        prefix.stderr && liveStderr
+          ? `${prefix.stderr}\n---\n${liveStderr}`
+          : liveStderr || prefix.stderr;
       setExecutionResult((prev) => ({
-        stdout: prefix.stdout + currentStdout,
+        stdout: prefix.stdout + liveStdout,
         stderr: mergedStderr || (!isFresh ? prev?.stderr || '' : ''),
-        exitCode: currentStderr ? 1 : 0,
+        exitCode: liveStderr ? 1 : 0,
         duration: prev?.duration || 0,
         engine: prev?.engine || defaultEngineName,
         plotImages: prefix.plotImages,
@@ -977,12 +1030,14 @@ function MainIDEApp() {
 
     // Batched live streaming callbacks: renders smoothly at display frame rate even under heavy print() loops
     const handleLiveStdout = (chunk: string) => {
-      currentStdout += chunk;
+      if (!chunk) return;
+      currentStdoutChunks.push(chunk);
       scheduleFlush();
     };
 
     const handleLiveStderr = (chunk: string) => {
-      currentStderr += chunk;
+      if (!chunk) return;
+      currentStderrChunks.push(chunk);
       scheduleFlush();
     };
 
@@ -1043,8 +1098,8 @@ function MainIDEApp() {
             if (serverErr?.name === 'AbortError' || abortController.signal.aborted) {
               setExecutionResult(
                 mergeRunResult({
-                  stdout: currentStdout,
-                  stderr: currentStderr || 'Đã dừng thực thi bởi người dùng.',
+                  stdout: getCurrentStdout(),
+                  stderr: getCurrentStderr() || 'Đã dừng thực thi bởi người dùng.',
                   exitCode: 130,
                   duration: 0,
                   engine: 'CPython 3.10 (Native Linux)',
@@ -1111,7 +1166,7 @@ function MainIDEApp() {
     } catch (err: any) {
       setExecutionResult(
         mergeRunResult({
-          stdout: currentStdout,
+          stdout: getCurrentStdout(),
           stderr:
             err?.name === 'AbortError'
               ? 'Đã dừng thực thi bởi người dùng.'
@@ -1447,6 +1502,7 @@ function MainIDEApp() {
         onSaveFile={handleSaveActiveFile}
         onDownloadPy={handleDownloadActivePy}
         onPickPyWithHandle={handlePickPyWithHandle}
+        onPickPyNative={handlePickPyNative}
         onOpenFromDefaultFolder={handleOpenFromDefaultFolder}
         onSyncShortcutsToDefaultFolder={handleSyncShortcutsToDefaultFolder}
         onUploadPy={(e) => {

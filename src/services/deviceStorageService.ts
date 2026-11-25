@@ -1,4 +1,4 @@
-import { Capacitor } from '@capacitor/core';
+import { Capacitor, registerPlugin } from '@capacitor/core';
 import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
 import { ShortcutKey, KeySize, migrateLegacyPairedShortcuts } from '../types/shortcuts';
 import { SyntaxTheme, DEFAULT_SYNTAX_THEME, TerminalTheme, normalizeTerminalTheme } from '../types/theme';
@@ -24,6 +24,42 @@ export interface DeviceFolderFile {
   path: string;
   size?: number;
   mtime?: number;
+  sourceDirectory?: 'DOCUMENTS' | 'DATA';
+}
+
+interface NativeStoragePlugin {
+  openDocument(): Promise<{
+    cancelled: boolean;
+    uri?: string;
+    name?: string;
+    content?: string;
+    writable?: boolean;
+  }>;
+  writeDocument(options: { uri: string; content: string }): Promise<{
+    ok: boolean;
+    uri: string;
+    name?: string;
+  }>;
+  createDocument(options: {
+    fileName: string;
+    mimeType?: string;
+    content?: string;
+    base64?: string;
+  }): Promise<{
+    cancelled: boolean;
+    uri?: string;
+    name?: string;
+  }>;
+}
+
+const NativeStorage = registerPlugin<NativeStoragePlugin>('NativeStorage');
+
+export function hasNativeStoragePlugin(): boolean {
+  try {
+    return Capacitor.isNativePlatform() && Capacitor.isPluginAvailable('NativeStorage');
+  } catch {
+    return false;
+  }
 }
 
 export function normalizeFolderName(input: string): string {
@@ -299,6 +335,7 @@ export async function writeFileToDefaultFolder(
   ok: boolean;
   displayPath: string;
   devicePath: string;
+  scopedStorageBlocked?: boolean;
   error?: string;
 }> {
   const folder = getDefaultFolderPath();
@@ -314,22 +351,49 @@ export async function writeFileToDefaultFolder(
 
     // 1. Try Directory.Documents first (or Data if resolveNativeDirectory chose Data)
     const resolved = await resolveNativeDirectory(parentFolder);
-    try {
+    const tryWriteToDir = async (dir: Directory) => {
       await Filesystem.writeFile({
         path: targetRelPath,
         data: content,
-        directory: resolved.directory,
+        directory: dir,
         encoding: Encoding.UTF8,
         recursive: true,
       });
+    };
+
+    try {
+      try {
+        await tryWriteToDir(resolved.directory);
+      } catch (firstErr) {
+        // Retry once after deleteFile in case existing file handle/truncate conflicted
+        if (resolved.directory === Directory.Documents) {
+          try {
+            await Filesystem.deleteFile({ path: targetRelPath, directory: Directory.Documents });
+            await tryWriteToDir(Directory.Documents);
+          } catch {
+            throw firstErr;
+          }
+        } else {
+          throw firstErr;
+        }
+      }
+
+      // Keep Directory.Data clean when Directory.Documents succeeded so reads never diverge
+      if (resolved.directory === Directory.Documents) {
+        await Filesystem.deleteFile({
+          path: targetRelPath,
+          directory: Directory.Data,
+        }).catch(() => {});
+      }
+
       return {
         ok: true,
         displayPath: `${resolved.label}/${targetRelPath}`,
         devicePath: targetRelPath,
       };
     } catch (primaryErr: any) {
-      // 2. If Documents write fails (e.g. Android 11+ Scoped Storage conflict with pre-existing file),
-      // automatically fall back to Directory.Data so saving never fails silently on APK!
+      // 2. If Documents write fails (e.g. Android 11+ Scoped Storage conflict with pre-existing unowned file),
+      // save to Directory.Data so edits are never lost AND list/read syncs pick the newer copy.
       if (resolved.directory !== Directory.Data) {
         try {
           await Filesystem.mkdir({
@@ -337,15 +401,10 @@ export async function writeFileToDefaultFolder(
             directory: Directory.Data,
             recursive: true,
           }).catch(() => {});
-          await Filesystem.writeFile({
-            path: targetRelPath,
-            data: content,
-            directory: Directory.Data,
-            encoding: Encoding.UTF8,
-            recursive: true,
-          });
+          await tryWriteToDir(Directory.Data);
           return {
             ok: true,
+            scopedStorageBlocked: true,
             displayPath: `Bộ nhớ ứng dụng/${targetRelPath}`,
             devicePath: targetRelPath,
           };
@@ -354,7 +413,10 @@ export async function writeFileToDefaultFolder(
             ok: false,
             displayPath: `Documents/${targetRelPath}`,
             devicePath: targetRelPath,
-            error: fallbackErr?.message || primaryErr?.message || 'Không thể ghi file vào bộ nhớ điện thoại',
+            error:
+              fallbackErr?.message ||
+              primaryErr?.message ||
+              'Không thể ghi file vào bộ nhớ điện thoại',
           };
         }
       }
@@ -400,34 +462,103 @@ export async function writeFileToDefaultFolder(
   };
 }
 
+export async function writeBinaryFileToDefaultFolder(
+  fileName: string,
+  base64Data: string
+): Promise<{
+  ok: boolean;
+  displayPath: string;
+  devicePath: string;
+  error?: string;
+}> {
+  const folder = getDefaultFolderPath();
+  const safeName = sanitizeFileName(fileName);
+  const targetRelPath = `${folder}/${safeName}`;
+
+  if (isNativeDevice()) {
+    const resolved = await resolveNativeDirectory(folder);
+    try {
+      await Filesystem.writeFile({
+        path: targetRelPath,
+        data: base64Data,
+        directory: resolved.directory,
+        recursive: true,
+      });
+      return {
+        ok: true,
+        displayPath: `${resolved.label}/${targetRelPath}`,
+        devicePath: targetRelPath,
+      };
+    } catch (err: any) {
+      if (hasNativeStoragePlugin()) {
+        try {
+          const created = await NativeStorage.createDocument({
+            fileName: safeName,
+            mimeType: 'application/zip',
+            base64: base64Data,
+          });
+          if (!created.cancelled && created.uri) {
+            return {
+              ok: true,
+              displayPath: created.name || safeName,
+              devicePath: targetRelPath,
+            };
+          }
+        } catch {}
+      }
+      return {
+        ok: false,
+        displayPath: `Documents/${targetRelPath}`,
+        devicePath: targetRelPath,
+        error: err?.message || 'Không thể lưu file nhị phân vào thiết bị',
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    displayPath: `Documents/${targetRelPath}`,
+    devicePath: targetRelPath,
+  };
+}
+
 export async function listFilesInDefaultFolder(): Promise<DeviceFolderFile[]> {
   const folder = getDefaultFolderPath();
 
   if (isNativeDevice()) {
-    try {
-      const resolved = await resolveNativeDirectory(folder);
-      const res = await Filesystem.readdir({
-        path: folder,
-        directory: resolved.directory,
-      });
-      return (res.files || [])
-        .filter(
-          (entry) =>
-            entry.type !== 'directory' &&
-            entry.name !== SHORTCUTS_CONFIG_FILENAME &&
-            entry.name !== FULL_BACKUP_FILENAME &&
-            (/\.(py|txt|json)$/i.test(entry.name) || !entry.name.startsWith('.'))
-        )
-        .map((entry) => ({
-          name: entry.name,
-          path: `${folder}/${entry.name}`,
-          size: entry.size,
-          mtime: entry.mtime,
-        }))
-        .sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
-    } catch {
-      return [];
-    }
+    const merged = new Map<string, DeviceFolderFile>();
+    const readDirSafe = async (dir: Directory, sourceDirectory: 'DOCUMENTS' | 'DATA') => {
+      try {
+        const res = await Filesystem.readdir({ path: folder, directory: dir });
+        for (const entry of res.files || []) {
+          if (
+            entry.type === 'directory' ||
+            entry.name === SHORTCUTS_CONFIG_FILENAME ||
+            entry.name === FULL_BACKUP_FILENAME ||
+            !(/\.(py|txt|json)$/i.test(entry.name) || !entry.name.startsWith('.'))
+          ) {
+            continue;
+          }
+          const existing = merged.get(entry.name);
+          const candidate: DeviceFolderFile = {
+            name: entry.name,
+            path: `${folder}/${entry.name}`,
+            size: entry.size,
+            mtime: entry.mtime,
+            sourceDirectory,
+          };
+          if (!existing || (candidate.mtime || 0) >= (existing.mtime || 0)) {
+            merged.set(entry.name, candidate);
+          }
+        }
+      } catch {
+        // ignore missing dir
+      }
+    };
+
+    await readDirSafe(Directory.Documents, 'DOCUMENTS');
+    await readDirSafe(Directory.Data, 'DATA');
+    return Array.from(merged.values()).sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
   }
 
   const webHandle = await getWebDirectoryHandle();
@@ -491,7 +622,14 @@ export async function readFileFromDefaultFolder(
       candidates.push({ directory: Directory.Data, path: safeName });
     }
 
+    const readableCandidates: Array<{
+      directory: Directory;
+      path: string;
+      mtime: number;
+      content: string;
+    }> = [];
     let lastErr: any = null;
+
     for (const candidate of candidates) {
       try {
         const res = await Filesystem.readFile({
@@ -500,10 +638,30 @@ export async function readFileFromDefaultFolder(
           encoding: Encoding.UTF8,
         });
         const text = typeof res.data === 'string' ? res.data : await res.data.text();
-        return { ok: true, content: text, devicePath: candidate.path };
+        let mtime = 0;
+        try {
+          const stat = await Filesystem.stat({
+            path: candidate.path,
+            directory: candidate.directory,
+          });
+          mtime = stat.mtime || 0;
+        } catch {}
+        readableCandidates.push({
+          directory: candidate.directory,
+          path: candidate.path,
+          mtime,
+          content: text,
+        });
       } catch (err: any) {
         lastErr = err;
       }
+    }
+
+    if (readableCandidates.length > 0) {
+      // Pick the newest modified copy if both Documents and Data exist
+      readableCandidates.sort((a, b) => b.mtime - a.mtime);
+      const best = readableCandidates[0];
+      return { ok: true, content: best.content, devicePath: best.path };
     }
 
     return {
@@ -535,6 +693,73 @@ export async function readFileFromDefaultFolder(
   return { ok: false, devicePath: relPath, error: 'Chưa liên kết thư mục mặc định.' };
 }
 
+export async function pickNativeDocumentForEdit(): Promise<{
+  supported: boolean;
+  cancelled?: boolean;
+  uri?: string;
+  name?: string;
+  content?: string;
+  writable?: boolean;
+  error?: string;
+}> {
+  if (!hasNativeStoragePlugin()) {
+    return { supported: false };
+  }
+  try {
+    const res = await NativeStorage.openDocument();
+    if (res.cancelled) {
+      return { supported: true, cancelled: true };
+    }
+    return {
+      supported: true,
+      uri: res.uri,
+      name: res.name || 'script.py',
+      content: res.content ?? '',
+      writable: res.writable !== false,
+    };
+  } catch (err: any) {
+    return {
+      supported: true,
+      error: err?.message || 'Không thể mở tệp từ bộ nhớ thiết bị',
+    };
+  }
+}
+
+export async function saveAsNativeDocument(
+  fileName: string,
+  content: string
+): Promise<{
+  supported: boolean;
+  cancelled?: boolean;
+  uri?: string;
+  name?: string;
+  error?: string;
+}> {
+  if (!hasNativeStoragePlugin()) {
+    return { supported: false };
+  }
+  try {
+    const res = await NativeStorage.createDocument({
+      fileName: sanitizeFileName(fileName),
+      mimeType: 'text/plain',
+      content,
+    });
+    if (res.cancelled) {
+      return { supported: true, cancelled: true };
+    }
+    return {
+      supported: true,
+      uri: res.uri,
+      name: res.name || fileName,
+    };
+  } catch (err: any) {
+    return {
+      supported: true,
+      error: err?.message || 'Không thể tạo tệp trên bộ nhớ thiết bị',
+    };
+  }
+}
+
 /**
  * Primary "Save" action:
  * Overwrites changes in the editor directly back into the .py file previously opened from the phone.
@@ -544,18 +769,20 @@ export async function saveActiveFileOverwrite(options: {
   content: string;
   fileHandle?: any;
   devicePath?: string;
+  nativeUri?: string;
 }): Promise<{
   ok: boolean;
-  method: 'handle' | 'native' | 'web-dir' | 'local';
+  method: 'handle' | 'native-saf' | 'native' | 'web-dir' | 'local';
   displayPath: string;
   devicePath?: string;
+  nativeUri?: string;
   error?: string;
 }> {
-  const { fileName, content, fileHandle, devicePath } = options;
+  const { fileName, content, fileHandle, devicePath, nativeUri } = options;
   const safeName = sanitizeFileName(fileName);
   const folder = getDefaultFolderPath();
 
-  // 1. Direct FileSystemFileHandle overwrite (when opened via showOpenFilePicker / Web folder)
+  // 1. Direct Web FileSystemFileHandle overwrite
   if (fileHandle) {
     try {
       const granted = await verifyHandlePermission(fileHandle, true, true);
@@ -575,18 +802,74 @@ export async function saveActiveFileOverwrite(options: {
     }
   }
 
-  // 2. Native Capacitor APK overwrite into Documents/<defaultFolder>/<file>
+  // 2. Direct Android SAF content:// URI overwrite (works across Downloads, Documents, SD Card on Android 10-15)
+  if (isNativeDevice() && nativeUri && hasNativeStoragePlugin()) {
+    try {
+      const safRes = await NativeStorage.writeDocument({ uri: nativeUri, content });
+      if (safRes?.ok) {
+        return {
+          ok: true,
+          method: 'native-saf',
+          displayPath: `File gốc trên điện thoại (${safRes.name || safeName})`,
+          devicePath: devicePath || `${folder}/${safeName}`,
+          nativeUri,
+        };
+      }
+    } catch (safErr: any) {
+      console.warn('Native SAF URI overwrite failed, prompting Save As or falling back:', safErr);
+      // Prompt user once to re-grant/pick target file via SAF if original URI was read-only or moved
+      const saveAsRes = await saveAsNativeDocument(safeName, content);
+      if (saveAsRes.supported && !saveAsRes.cancelled && saveAsRes.uri) {
+        return {
+          ok: true,
+          method: 'native-saf',
+          displayPath: `Đã lưu đè file trên máy (${saveAsRes.name || safeName})`,
+          devicePath: devicePath || `${folder}/${safeName}`,
+          nativeUri: saveAsRes.uri,
+        };
+      }
+    }
+  }
+
+  // 3. Native Capacitor APK overwrite into Documents/<defaultFolder>/<file>
   if (isNativeDevice()) {
     const targetPath = devicePath || `${folder}/${safeName}`;
     const writeRes = await writeFileToDefaultFolder(safeName, content, targetPath);
+    if (writeRes.ok && !writeRes.scopedStorageBlocked) {
+      return {
+        ok: true,
+        method: 'native',
+        displayPath: writeRes.displayPath,
+        devicePath: writeRes.devicePath,
+        nativeUri,
+      };
+    }
+
+    // If Android 11+ Scoped Storage blocked overwriting a pre-existing file in Documents/,
+    // let the user grant write access directly via Android's native picker so the public file is truly updated!
+    if (writeRes.scopedStorageBlocked && hasNativeStoragePlugin()) {
+      const safSave = await saveAsNativeDocument(safeName, content);
+      if (safSave.supported && !safSave.cancelled && safSave.uri) {
+        return {
+          ok: true,
+          method: 'native-saf',
+          displayPath: `Đã lưu đè qua bộ chọn Android (${safSave.name || safeName})`,
+          devicePath: writeRes.devicePath,
+          nativeUri: safSave.uri,
+        };
+      }
+    }
+
     if (writeRes.ok) {
       return {
         ok: true,
         method: 'native',
         displayPath: writeRes.displayPath,
         devicePath: writeRes.devicePath,
+        nativeUri,
       };
     }
+
     return {
       ok: false,
       method: 'local',
@@ -595,7 +878,7 @@ export async function saveActiveFileOverwrite(options: {
     };
   }
 
-  // 3. Web linked DirectoryHandle overwrite
+  // 4. Web linked DirectoryHandle overwrite
   const webWrite = await writeFileToDefaultFolder(safeName, content);
   if (webWrite.ok) {
     return {
@@ -606,7 +889,7 @@ export async function saveActiveFileOverwrite(options: {
     };
   }
 
-  // 4. Fallback: saved in app localStorage
+  // 5. Fallback: saved in app localStorage
   return {
     ok: true,
     method: 'local',

@@ -726,12 +726,12 @@ export const DrawerMenu: React.FC<DrawerMenuProps> = ({
                   )}
                   <span>
                     {downloadingUpdate
-                      ? 'Đang chuẩn bị gói cập nhật...'
+                      ? 'Đang nén gói cập nhật offline...'
                       : 'Tải file cập nhật mã nguồn cũ (.ZIP)'}
                   </span>
                 </button>
                 <p className="text-[10px] text-slate-400 leading-snug px-0.5">
-                  Gồm đủ <span className="font-mono text-amber-300/90">src/</span>, icon mới &amp; <span className="font-mono text-amber-300/90">build-apk.yml</span> để bạn tải lên GitHub bằng Token.
+                  Tạo offline đủ <span className="font-mono text-amber-300/90">src/</span>, icon &amp; <span className="font-mono text-amber-300/90">build-apk.yml</span> (giải nén đè vào gốc repo, hoặc bấm &ldquo;Đóng gói Android APK&rdquo; ở trên để đẩy thẳng bằng Token GitHub).
                 </p>
                 {updateNotice && (
                   <div

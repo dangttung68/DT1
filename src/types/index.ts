@@ -6,6 +6,7 @@ export interface CodeFile {
   content: string;
   isModified?: boolean;
   devicePath?: string;
+  nativeUri?: string;
   sourceType?: 'local' | 'phone' | 'drive';
 }
 

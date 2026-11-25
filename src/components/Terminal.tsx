@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import {
   Send,
   RotateCw,
@@ -119,9 +119,40 @@ export const Terminal: React.FC<TerminalProps> = ({
     }
   };
 
-  const lineCount = ((result?.stdout || '') + (result?.stderr || ''))
-    .split('\n')
-    .filter((l) => l.length > 0).length || (isWaitingInput ? 1 : 0);
+  const MAX_RENDER_CHARS = 150000;
+
+  const { displayedStdout, truncatedKb } = useMemo(() => {
+    const raw = result?.stdout || '';
+    if (raw.length <= MAX_RENDER_CHARS) {
+      return { displayedStdout: raw, truncatedKb: 0 };
+    }
+    const startIdx = raw.length - MAX_RENDER_CHARS;
+    const nextNewline = raw.indexOf('\n', startIdx);
+    const sliceStart = nextNewline !== -1 && nextNewline - startIdx < 4096 ? nextNewline + 1 : startIdx;
+    return {
+      displayedStdout: raw.slice(sliceStart),
+      truncatedKb: Math.max(1, Math.round(sliceStart / 1024)),
+    };
+  }, [result?.stdout]);
+
+  const lineCount = useMemo(() => {
+    const countNonEmpty = (text: string): number => {
+      if (!text) return 0;
+      let count = 0;
+      let lineStart = 0;
+      const len = text.length;
+      for (let i = 0; i < len; i++) {
+        if (text.charCodeAt(i) === 10) {
+          if (i > lineStart) count++;
+          lineStart = i + 1;
+        }
+      }
+      if (len > lineStart) count++;
+      return count;
+    };
+    const total = countNonEmpty(result?.stdout || '') + countNonEmpty(result?.stderr || '');
+    return total || (isWaitingInput ? 1 : 0);
+  }, [result?.stdout, result?.stderr, isWaitingInput]);
 
   const hasError =
     !isWaitingInput &&
@@ -338,19 +369,26 @@ export const Terminal: React.FC<TerminalProps> = ({
         )}
 
         {/* Stdout Output */}
-        {result?.stdout && (
-          <pre
-            className="whitespace-pre-wrap break-words font-mono leading-relaxed"
-            style={{ color: activeTheme.foreground }}
-          >
-            {result.stdout}
-            {isWaitingInput && (
-              <span
-                className="inline-block w-2 h-4 align-middle ml-1 animate-pulse"
-                style={{ backgroundColor: activeTheme.promptColor }}
-              />
+        {displayedStdout && (
+          <>
+            {truncatedKb > 0 && (
+              <div className="text-[11px] px-2.5 py-1 rounded-lg bg-slate-800/75 text-slate-300 border border-slate-700/70">
+                Đã thu gọn {truncatedKb} KB đầu để Terminal luôn mượt — nhấn nút Sao chép ở trên để lấy toàn bộ kết quả.
+              </div>
             )}
-          </pre>
+            <pre
+              className="whitespace-pre-wrap break-words font-mono leading-relaxed"
+              style={{ color: activeTheme.foreground }}
+            >
+              {displayedStdout}
+              {isWaitingInput && (
+                <span
+                  className="inline-block w-2 h-4 align-middle ml-1 animate-pulse"
+                  style={{ backgroundColor: activeTheme.promptColor }}
+                />
+              )}
+            </pre>
+          </>
         )}
 
         {/* Fallback prompt display if waiting for input with no stdout captured */}

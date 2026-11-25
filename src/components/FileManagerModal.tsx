@@ -32,6 +32,7 @@ import {
   supportsFileSystemAccess,
   pickWebDefaultDirectory,
   isNativeDevice,
+  hasNativeStoragePlugin,
 } from '../services/deviceStorageService';
 
 interface FileManagerModalProps {
@@ -47,6 +48,7 @@ interface FileManagerModalProps {
   onDownloadPy: () => Promise<{ ok: boolean; message: string }>;
   onUploadPy: (e: React.ChangeEvent<HTMLInputElement>) => void;
   onPickPyWithHandle: () => Promise<boolean>;
+  onPickPyNative?: () => Promise<{ handled: boolean; opened: boolean; error?: string }>;
   onOpenFromDefaultFolder: (fileName: string, relPath: string) => Promise<{ ok: boolean; message: string }>;
   onSyncShortcutsToDefaultFolder: () => Promise<{ ok: boolean; message: string }>;
   onResetCode: () => void;
@@ -67,6 +69,7 @@ export const FileManagerModal: React.FC<FileManagerModalProps> = ({
   onDownloadPy,
   onUploadPy,
   onPickPyWithHandle,
+  onPickPyNative,
   onOpenFromDefaultFolder,
   onSyncShortcutsToDefaultFolder,
   onResetCode,
@@ -89,6 +92,7 @@ export const FileManagerModal: React.FC<FileManagerModalProps> = ({
   const [loadingFolder, setLoadingFolder] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
+  const fallbackInputRef = React.useRef<HTMLInputElement>(null);
 
   const refreshFolderState = async () => {
     setLoadingFolder(true);
@@ -212,10 +216,24 @@ export const FileManagerModal: React.FC<FileManagerModalProps> = ({
       if (opened) {
         onClose();
       }
+      return;
     }
+    if (hasNativeStoragePlugin() && onPickPyNative) {
+      const res = await onPickPyNative();
+      if (res.handled) {
+        if (res.opened) {
+          onClose();
+        } else if (res.error) {
+          setNotice({ ok: false, text: res.error });
+        }
+        return;
+      }
+    }
+    fallbackInputRef.current?.click();
   };
 
   const canUseFsOpenPicker = supportsFileSystemAccess();
+  const canUseNativeSaf = hasNativeStoragePlugin();
   const canPickDir = supportsDirectoryPicker();
 
   return (
@@ -358,7 +376,7 @@ export const FileManagerModal: React.FC<FileManagerModalProps> = ({
                             </span>
                             {file.sourceType === 'phone' && (
                               <span className="px-1.5 py-0.5 rounded bg-purple-500/20 border border-purple-400/40 text-[9px] text-purple-200 font-semibold shrink-0">
-                                ĐT
+                                {file.nativeUri ? 'Ghi đè ĐT' : 'ĐT'}
                               </span>
                             )}
                           </div>
@@ -435,19 +453,31 @@ export const FileManagerModal: React.FC<FileManagerModalProps> = ({
                 </span>
               </button>
 
-              {canUseFsOpenPicker ? (
-                <button
-                  onClick={handleOpenPhoneFile}
-                  className="min-h-[64px] px-2 py-2.5 hover:bg-purple-500/10 active:bg-purple-500/20 flex flex-col items-center justify-center gap-1 text-center transition"
-                >
-                  <Upload className="w-4.5 h-4.5 text-purple-300 shrink-0" />
-                  <span className="text-[11px] font-semibold text-slate-100 leading-tight">
-                    Mở file .py
-                  </span>
-                  <span className="text-[9.5px] text-purple-300/75 leading-none">
-                    Từ bộ nhớ
-                  </span>
-                </button>
+              {canUseFsOpenPicker || canUseNativeSaf ? (
+                <>
+                  <button
+                    onClick={handleOpenPhoneFile}
+                    className="min-h-[64px] px-2 py-2.5 hover:bg-purple-500/10 active:bg-purple-500/20 flex flex-col items-center justify-center gap-1 text-center transition"
+                  >
+                    <Upload className="w-4.5 h-4.5 text-purple-300 shrink-0" />
+                    <span className="text-[11px] font-semibold text-slate-100 leading-tight">
+                      Mở file .py
+                    </span>
+                    <span className="text-[9.5px] text-purple-300/75 leading-none">
+                      Từ bộ nhớ
+                    </span>
+                  </button>
+                  <input
+                    ref={fallbackInputRef}
+                    type="file"
+                    accept=".py,.txt,.json,text/plain,text/x-python"
+                    onChange={(e) => {
+                      onUploadPy(e);
+                      onClose();
+                    }}
+                    className="hidden"
+                  />
+                </>
               ) : (
                 <label className="min-h-[64px] px-2 py-2.5 hover:bg-purple-500/10 active:bg-purple-500/20 flex flex-col items-center justify-center gap-1 text-center transition cursor-pointer">
                   <Upload className="w-4.5 h-4.5 text-purple-300 shrink-0" />
@@ -467,6 +497,18 @@ export const FileManagerModal: React.FC<FileManagerModalProps> = ({
                     className="hidden"
                   />
                 </label>
+              )}
+            </div>
+
+            <div className="px-2 py-1 rounded-lg bg-[#081020] border border-cyan-950/60 text-[10.5px] text-slate-400 truncate">
+              {activeFile?.nativeUri ? (
+                <span>
+                  Đích Save: <span className="text-emerald-300 font-semibold">Ghi đè trực tiếp file gốc trên điện thoại</span>
+                </span>
+              ) : (
+                <span>
+                  Đích Save: <span className="text-cyan-300 font-mono">{displayFolderPath}/{activeFile?.name}</span>
+                </span>
               )}
             </div>
 

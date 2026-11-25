@@ -89,10 +89,13 @@ const PYODIDE_PREBUILT_PACKAGES = new Set<string>([
 
 export type PyodideWarmState = 'idle' | 'warming' | 'ready' | 'error';
 
+const MAX_RAM_ASSET_BYTES = 2 * 1024 * 1024; // Keep small manifests/scripts in RAM; avoid duplicating large WASM/wheels in heap
+
 let pyodideLoadingPromise: Promise<any> | null = null;
 let runtimeBootstrapped = false;
 let micropipLoaded = false;
 let sitePackagesRestored = false;
+let matplotlibConfigured = false;
 let fetchInterceptorInstalled = false;
 let originalFetchRef: typeof window.fetch | null = null;
 let dbPromise: Promise<IDBDatabase> | null = null;
@@ -102,7 +105,176 @@ let coreAssetsPrecached = false;
 const memoryAssetCache = new Map<string, CachedCdnAsset>();
 const inflightAssetFetches = new Map<string, Promise<CachedCdnAsset | null>>();
 const verifiedImportableModules = new Set<string>();
+const verifiedImportSignatureCache = new Map<string, string[]>();
+const sleepTransformCache = new Map<string, string>();
+const MAX_LOCAL_CACHE_ENTRIES = 16;
+let lastPrewarmedImportSignature = '';
 const pyodideWarmListeners = new Set<(state: PyodideWarmState) => void>();
+
+interface CachedMainPyFns {
+  runSync: any;
+  prepareAsync: any;
+  finishAsync: any;
+  transformSleep: any;
+  flushIo: any;
+  getIoState: any;
+}
+let cachedMainPyFns: CachedMainPyFns | null = null;
+
+function extractImportSignature(code: string): string {
+  if (!code || !code.includes('import')) return '';
+  const mods = new Set<string>();
+  const importRegex = /^\s*(?:import|from)\s+([a-zA-Z0-9_]+)/gm;
+  let match: RegExpExecArray | null;
+  while ((match = importRegex.exec(code)) !== null) {
+    if (match[1]) mods.add(match[1]);
+  }
+  if (mods.size === 0) return '';
+  return Array.from(mods).sort().join(',');
+}
+
+// --- Dedicated Web Worker Controller for 60fps Non-Blocking UI & Hard Cancel ---
+let pyodideWorker: Worker | null = null;
+let workerUnavailable = typeof Worker === 'undefined';
+let workerReqSeq = 0;
+
+interface WorkerPendingRequest {
+  resolve: (val: any) => void;
+  reject: (err: any) => void;
+  onStdout?: (chunk: string) => void;
+  onStderr?: (chunk: string) => void;
+  onStatus?: (msg: string) => void;
+}
+
+const workerPendingRequests = new Map<number, WorkerPendingRequest>();
+
+function getSavedPkgSnapshot(): Array<{ name: string; source: 'pyodide' | 'micropip' | 'cpython' }> {
+  return getSavedUserPipPackages().map((p) => ({ name: p.name, source: p.source }));
+}
+
+function terminatePyodideWorker(reason?: Error): void {
+  if (pyodideWorker) {
+    try {
+      pyodideWorker.terminate();
+    } catch {}
+    pyodideWorker = null;
+  }
+  for (const [, pending] of workerPendingRequests) {
+    pending.reject(reason || new DOMException('Đã dừng thực thi.', 'AbortError'));
+  }
+  workerPendingRequests.clear();
+  if (!window.pyodideInstance) {
+    setPyodideWarmState('idle');
+  }
+}
+
+function ensurePyodideWorker(): Worker | null {
+  if (workerUnavailable || typeof Worker === 'undefined') return null;
+  if (pyodideWorker) return pyodideWorker;
+
+  try {
+    const worker = new Worker(new URL('../workers/pyodideWorker.ts', import.meta.url), {
+      type: 'module',
+    });
+
+    worker.onmessage = (ev: MessageEvent) => {
+      const data = ev.data || {};
+      if (data.type === 'warmState') {
+        if (data.state === 'ready' || data.state === 'error' || data.state === 'warming') {
+          setPyodideWarmState(data.state);
+        }
+        return;
+      }
+
+      const pending = typeof data.reqId === 'number' ? workerPendingRequests.get(data.reqId) : undefined;
+      if (!pending) return;
+
+      if (data.type === 'stdout') {
+        pending.onStdout?.(data.chunk || '');
+        return;
+      }
+      if (data.type === 'stderr') {
+        pending.onStderr?.(data.chunk || '');
+        return;
+      }
+      if (data.type === 'status') {
+        pending.onStatus?.(data.message || '');
+        return;
+      }
+
+      workerPendingRequests.delete(data.reqId);
+      pending.resolve(data);
+    };
+
+    worker.onerror = () => {
+      workerUnavailable = true;
+      terminatePyodideWorker(new Error('Pyodide Worker fallback'));
+    };
+
+    pyodideWorker = worker;
+    return worker;
+  } catch {
+    workerUnavailable = true;
+    return null;
+  }
+}
+
+function callPyodideWorker<T = any>(
+  payload: Record<string, any>,
+  callbacks?: {
+    signal?: AbortSignal;
+    onStdout?: (chunk: string) => void;
+    onStderr?: (chunk: string) => void;
+    onStatus?: (msg: string) => void;
+  }
+): Promise<T> {
+  const worker = ensurePyodideWorker();
+  if (!worker) {
+    return Promise.reject(new Error('Worker unavailable'));
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    const reqId = ++workerReqSeq;
+    const signal = callbacks?.signal;
+
+    const onAbort = () => {
+      workerPendingRequests.delete(reqId);
+      // Hard-terminate worker to instantly stop even infinite loops like `while True: pass`
+      terminatePyodideWorker(new DOMException('Đã dừng thực thi.', 'AbortError'));
+      // Quietly re-warm a clean Worker from IndexedDB cache so next run is fast
+      setTimeout(() => {
+        if (!workerUnavailable) {
+          prewarmPyodide();
+        }
+      }, 250);
+      reject(new DOMException('Đã dừng thực thi.', 'AbortError'));
+    };
+
+    if (signal) {
+      if (signal.aborted) {
+        reject(new DOMException('Đã dừng thực thi.', 'AbortError'));
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    workerPendingRequests.set(reqId, {
+      resolve: (val) => {
+        if (signal) signal.removeEventListener('abort', onAbort);
+        resolve(val);
+      },
+      reject: (err) => {
+        if (signal) signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+      onStdout: callbacks?.onStdout,
+      onStderr: callbacks?.onStderr,
+      onStatus: callbacks?.onStatus,
+    });
+
+    worker.postMessage({ ...payload, reqId });
+  });
+}
 
 function setPyodideWarmState(next: PyodideWarmState): void {
   if (pyodideWarmState === next) return;
@@ -241,12 +413,18 @@ export async function removeUserPipPackage(packageName: string): Promise<Persist
   }
 
   verifiedImportableModules.clear();
+  verifiedImportSignatureCache.clear();
+  lastPrewarmedImportSignature = '';
 
   if (next.length === 0) {
     await clearSitePackagesCache().catch(() => {});
   } else {
     await removePackageBundleFromIDB(clean).catch(() => {});
     await removeMatchingLegacyEntries(clean).catch(() => {});
+  }
+
+  if (pyodideWorker && !workerUnavailable) {
+    void callPyodideWorker({ type: 'syncPackages', action: 'clear', packageName: clean }).catch(() => {});
   }
   return next;
 }
@@ -363,8 +541,8 @@ async function getCdnAssetFromIDB(url: string): Promise<CachedCdnAsset | null> {
       req.onerror = () => reject(req.error);
     });
     if (record && record.data && record.data.byteLength > 0) {
-      // Keep small-to-medium hot metadata/wasm buffers in memory for instant repeat reads
-      if (record.size <= 16 * 1024 * 1024) {
+      // Keep tiny manifests/scripts in RAM for instant repeat reads without duplicating large WASM buffers
+      if (record.size <= MAX_RAM_ASSET_BYTES) {
         memoryAssetCache.set(url, record);
       }
       return record;
@@ -417,7 +595,7 @@ async function putCdnAssetToIDB(asset: CachedCdnAsset): Promise<void> {
     return;
   }
 
-  if (asset.size <= 16 * 1024 * 1024) {
+  if (asset.size <= MAX_RAM_ASSET_BYTES) {
     memoryAssetCache.set(asset.url, asset);
   }
 
@@ -973,6 +1151,10 @@ export async function restorePipBackupData(
     }
   }
 
+  if (pyodideWorker && !workerUnavailable) {
+    void callPyodideWorker({ type: 'syncPackages', action: 'restore' }).catch(() => {});
+  }
+
   if (typeof window !== 'undefined' && window.pyodideInstance) {
     sitePackagesRestored = true;
     if (decodedBundles.length > 0) {
@@ -1001,20 +1183,24 @@ import os
 import builtins
 import json
 import ast
-from js import window
+import time
+from collections import deque
 
-class _PydroidWaitingInput(Exception):
+class _PydroidWaitingInput(BaseException):
     """Raised to yield execution back to JS runtime when input queue is empty"""
     def __init__(self, prompt=""):
         self.prompt = prompt
         super().__init__(prompt)
 
-_pydroid_input_queue = []
-_pydroid_stdout_buffer = []
-_pydroid_stderr_buffer = []
+_pydroid_input_queue = deque()
+_pydroid_stderr_buffer = deque(maxlen=200)
 _pydroid_last_prompt = ""
 _pydroid_is_waiting_input = False
 _pydroid_echo_enabled = True
+_pydroid_js_stdout_cb = None
+_pydroid_js_stderr_cb = None
+_pydroid_code_cache = {}
+_pydroid_monotonic = time.monotonic
 
 class _PydroidTTYStream:
     encoding = 'utf-8'
@@ -1022,26 +1208,51 @@ class _PydroidTTYStream:
 
     def __init__(self, stream_type='stdout'):
         self.stream_type = stream_type
+        self._is_stdout = (stream_type == 'stdout')
+        self._pending = []
+        self._pending_len = 0
+        self._pending_count = 0
+        self._last_flush = 0.0
+
+    def _emit(self, text):
+        if not text:
+            return
+        cb = _pydroid_js_stdout_cb if self._is_stdout else _pydroid_js_stderr_cb
+        if cb is not None:
+            try:
+                cb(text)
+            except Exception:
+                pass
 
     def write(self, s):
         if s is None:
             return 0
-        text = str(s)
-        if not text:
+        text = s if type(s) is str else str(s)
+        n = len(text)
+        if n == 0:
             return 0
-        buf = _pydroid_stdout_buffer if self.stream_type == 'stdout' else _pydroid_stderr_buffer
-        buf.append(text)
-        try:
-            cb_name = '__pydroid_tty_stdout' if self.stream_type == 'stdout' else '__pydroid_tty_stderr'
-            cb = getattr(window, cb_name, None)
-            if cb is not None:
-                cb(text)
-        except Exception:
-            pass
-        return len(text)
+        if not self._is_stdout:
+            _pydroid_stderr_buffer.append(text)
+        self._pending.append(text)
+        self._pending_len += n
+        self._pending_count += 1
+        if self._pending_len >= 4096 or not self._is_stdout:
+            self.flush()
+        elif '\\n' in text or (self._pending_count & 31) == 0:
+            now = _pydroid_monotonic()
+            if (now - self._last_flush) >= 0.016:
+                self.flush()
+        return n
 
     def flush(self):
-        pass
+        if not self._pending:
+            return
+        joined = "".join(self._pending)
+        self._pending.clear()
+        self._pending_len = 0
+        self._pending_count = 0
+        self._last_flush = _pydroid_monotonic()
+        self._emit(joined)
 
     def isatty(self):
         return True
@@ -1056,7 +1267,7 @@ class _PydroidTTYStream:
         return False
 
     def fileno(self):
-        return 1 if self.stream_type == 'stdout' else 2
+        return 1 if self._is_stdout else 2
 
 class _PydroidTTYStdin:
     encoding = 'utf-8'
@@ -1079,10 +1290,12 @@ class _PydroidTTYStdin:
 
     def readline(self, size=-1):
         global _pydroid_is_waiting_input, _pydroid_last_prompt
-        if len(_pydroid_input_queue) > 0:
-            val = str(_pydroid_input_queue.pop(0))
+        sys.stdout.flush()
+        if _pydroid_input_queue:
+            val = str(_pydroid_input_queue.popleft())
             if _pydroid_echo_enabled:
                 sys.stdout.write(val + "\\n")
+                sys.stdout.flush()
             return val + "\\n"
 
         _pydroid_is_waiting_input = True
@@ -1091,7 +1304,7 @@ class _PydroidTTYStdin:
     def read(self, size=-1):
         if size is None or size < 0:
             chunks = []
-            while len(_pydroid_input_queue) > 0:
+            while _pydroid_input_queue:
                 chunks.append(self.readline())
             return "".join(chunks)
         res = self.readline()
@@ -1099,7 +1312,7 @@ class _PydroidTTYStdin:
 
     def readlines(self, hint=-1):
         lines = []
-        while len(_pydroid_input_queue) > 0:
+        while _pydroid_input_queue:
             lines.append(self.readline())
         return lines
 
@@ -1107,7 +1320,7 @@ class _PydroidTTYStdin:
         return self
 
     def __next__(self):
-        if len(_pydroid_input_queue) > 0:
+        if _pydroid_input_queue:
             return self.readline()
         raise StopIteration
 
@@ -1117,15 +1330,17 @@ sys.stdin = _PydroidTTYStdin()
 
 def _custom_input(prompt=""):
     global _pydroid_last_prompt, _pydroid_is_waiting_input
-    p_str = str(prompt) if prompt is not None else ""
+    p_str = "" if prompt is None else (prompt if type(prompt) is str else str(prompt))
     _pydroid_last_prompt = p_str
     if p_str:
         sys.stdout.write(p_str)
+    sys.stdout.flush()
 
-    if len(_pydroid_input_queue) > 0:
-        val = str(_pydroid_input_queue.pop(0))
+    if _pydroid_input_queue:
+        val = str(_pydroid_input_queue.popleft())
         if _pydroid_echo_enabled:
             sys.stdout.write(val + "\\n")
+            sys.stdout.flush()
         return val
 
     _pydroid_is_waiting_input = True
@@ -1133,14 +1348,108 @@ def _custom_input(prompt=""):
 
 builtins.input = _custom_input
 
-def _pydroid_reset_io(inputs_json):
-    global _pydroid_input_queue, _pydroid_stdout_buffer, _pydroid_stderr_buffer
-    global _pydroid_last_prompt, _pydroid_is_waiting_input
-    _pydroid_input_queue = json.loads(inputs_json)
-    _pydroid_stdout_buffer = []
-    _pydroid_stderr_buffer = []
+def _pydroid_prepare_io(inputs_json, stdout_cb, stderr_cb):
+    global _pydroid_input_queue, _pydroid_last_prompt, _pydroid_is_waiting_input
+    global _pydroid_js_stdout_cb, _pydroid_js_stderr_cb
+    _pydroid_input_queue = deque(json.loads(inputs_json))
+    _pydroid_stderr_buffer.clear()
     _pydroid_last_prompt = ""
     _pydroid_is_waiting_input = False
+    _pydroid_js_stdout_cb = stdout_cb
+    _pydroid_js_stderr_cb = stderr_cb
+    sys.stdout._pending.clear()
+    sys.stdout._pending_len = 0
+    sys.stdout._pending_count = 0
+    sys.stdout._last_flush = 0.0
+    sys.stderr._pending.clear()
+    sys.stderr._pending_len = 0
+    sys.stderr._pending_count = 0
+    sys.stderr._last_flush = 0.0
+
+def _pydroid_flush_io():
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+def _pydroid_get_io_state():
+    return json.dumps({
+        "waiting": bool(_pydroid_is_waiting_input),
+        "prompt": _pydroid_last_prompt or "",
+        "stderrTail": "".join(_pydroid_stderr_buffer)
+    })
+
+def _pydroid_capture_plots():
+    _captured_plots = []
+    if 'matplotlib.pyplot' in sys.modules:
+        try:
+            import matplotlib.pyplot as plt
+            import base64
+            for fig_num in plt.get_fignums():
+                fig = plt.figure(fig_num)
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', bbox_inches='tight', dpi=120)
+                buf.seek(0)
+                _captured_plots.append(base64.b64encode(buf.read()).decode('utf-8'))
+                plt.close(fig)
+        except Exception:
+            pass
+    return _captured_plots
+
+def _pydroid_run_sync(src, inputs_json, stdout_cb, stderr_cb, capture_plots):
+    _pydroid_prepare_io(inputs_json, stdout_cb, stderr_cb)
+    cached = _pydroid_code_cache.get(src)
+    if cached is None:
+        try:
+            code_obj = compile(src, 'main.py', 'exec')
+        except SyntaxError as syn_err:
+            err_msg = str(syn_err)
+            if "'await' outside" in err_msg or "'async for' outside" in err_msg or "'async with' outside" in err_msg:
+                if len(_pydroid_code_cache) >= 16:
+                    _pydroid_code_cache.pop(next(iter(_pydroid_code_cache)))
+                _pydroid_code_cache[src] = ("ASYNC", None)
+                return json.dumps({"status": "need_async"})
+            _pydroid_flush_io()
+            import traceback
+            tb = "".join(traceback.format_exception_only(type(syn_err), syn_err))
+            return json.dumps({"status": "error", "error": tb})
+        if len(_pydroid_code_cache) >= 16:
+            _pydroid_code_cache.pop(next(iter(_pydroid_code_cache)))
+        _pydroid_code_cache[src] = ("SYNC", code_obj)
+    else:
+        kind, code_obj = cached
+        if kind == "ASYNC":
+            return json.dumps({"status": "need_async"})
+
+    ns = {"__name__": "__main__", "__file__": "main.py"}
+    try:
+        exec(code_obj, ns)
+    except _PydroidWaitingInput as wait_exc:
+        _pydroid_flush_io()
+        return json.dumps({
+            "status": "waiting_input",
+            "prompt": wait_exc.prompt or _pydroid_last_prompt or "input():"
+        })
+    except EOFError:
+        _pydroid_flush_io()
+        return json.dumps({
+            "status": "waiting_input",
+            "prompt": _pydroid_last_prompt or "input():"
+        })
+    except BaseException as exc:
+        _pydroid_flush_io()
+        import traceback
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        return json.dumps({"status": "error", "error": tb})
+    finally:
+        ns.clear()
+
+    _pydroid_flush_io()
+    plots = _pydroid_capture_plots() if capture_plots else []
+    return json.dumps({"status": "ok", "plots": plots})
+
+def _pydroid_finish_async(capture_plots):
+    _pydroid_flush_io()
+    plots = _pydroid_capture_plots() if capture_plots else []
+    return json.dumps(plots)
 
 def _pydroid_transform_sleep(src):
     try:
@@ -1203,8 +1512,8 @@ def _pydroid_transform_sleep(src):
     except Exception:
         return src
 
-# Pre-warm common stdlib dependencies used in default_main_py and starter programs
-for _mod_name in ("math", "random", "time", "datetime", "platform", "re", "collections", "itertools", "functools", "statistics"):
+# Pre-warm lightweight stdlib dependencies used in starter programs
+for _mod_name in ("math", "random", "time", "datetime"):
     try:
         __import__(_mod_name)
     except Exception:
@@ -1370,6 +1679,14 @@ export async function getPyodideInstance(onProgress?: (message: string) => void)
 
       if (!runtimeBootstrapped) {
         await pyodide.runPythonAsync(CORE_BOOTSTRAP_SCRIPT);
+        cachedMainPyFns = {
+          runSync: pyodide.globals.get('_pydroid_run_sync'),
+          prepareAsync: pyodide.globals.get('_pydroid_prepare_io'),
+          finishAsync: pyodide.globals.get('_pydroid_finish_async'),
+          transformSleep: pyodide.globals.get('_pydroid_transform_sleep'),
+          flushIo: pyodide.globals.get('_pydroid_flush_io'),
+          getIoState: pyodide.globals.get('_pydroid_get_io_state'),
+        };
         runtimeBootstrapped = true;
       }
 
@@ -1394,6 +1711,22 @@ export async function getPyodideInstance(onProgress?: (message: string) => void)
 // Pre-cache any packages/dependencies referenced in default_main_py or the active editor code
 export async function prewarmCodeDependencies(code: string): Promise<void> {
   if (typeof window === 'undefined' || !code || !code.trim()) return;
+  const sig = extractImportSignature(code);
+  if (!sig || sig === lastPrewarmedImportSignature) return;
+  lastPrewarmedImportSignature = sig;
+
+  if (!workerUnavailable) {
+    try {
+      await callPyodideWorker({
+        type: 'prewarmDeps',
+        code,
+        savedPackages: getSavedPkgSnapshot(),
+      });
+      return;
+    } catch {
+      // fall through to main thread if worker errored
+    }
+  }
   try {
     const pyodide = await getPyodideInstance();
     await ensureCodePackagesReady(pyodide, code);
@@ -1406,6 +1739,37 @@ export async function prewarmCodeDependencies(code: string): Promise<void> {
 export function prewarmPyodide(initialCode?: string): void {
   if (typeof window === 'undefined') return;
   installPyodideFetchCache();
+
+  if (!workerUnavailable) {
+    if (getPyodideWarmState() === 'ready') {
+      if (initialCode) void prewarmCodeDependencies(initialCode);
+      return;
+    }
+    if (getPyodideWarmState() === 'warming') {
+      return;
+    }
+    setPyodideWarmState('warming');
+    void callPyodideWorker({
+      type: 'init',
+      initialCode: initialCode || '',
+      savedPackages: getSavedPkgSnapshot(),
+    })
+      .then((res: any) => {
+        if (res?.ok) {
+          setPyodideWarmState('ready');
+        } else if (workerUnavailable) {
+          prewarmPyodide(initialCode);
+        } else {
+          setPyodideWarmState('error');
+        }
+      })
+      .catch(() => {
+        if (workerUnavailable) {
+          prewarmPyodide(initialCode);
+        }
+      });
+    return;
+  }
 
   if (window.pyodideInstance && runtimeBootstrapped) {
     setPyodideWarmState('ready');
@@ -1453,9 +1817,36 @@ export async function installPyodidePackage(
     throw new Error('Tên thư viện không hợp lệ.');
   }
 
+  verifiedImportableModules.clear();
+  verifiedImportSignatureCache.clear();
+  lastPrewarmedImportSignature = '';
+
+  if (!workerUnavailable) {
+    try {
+      const res = await callPyodideWorker<any>(
+        {
+          type: 'installPackage',
+          packageName: trimmed,
+          savedPackages: getSavedPkgSnapshot(),
+        },
+        { onStatus: onProgress }
+      );
+      if (res?.ok) {
+        saveUserPipPackage(normalized, res.source === 'pyodide' ? 'pyodide' : 'micropip');
+        return true;
+      }
+      if (!workerUnavailable) {
+        throw new Error(res?.error || `Không thể cài đặt ${trimmed}`);
+      }
+    } catch (err: any) {
+      if (!workerUnavailable) {
+        throw new Error(`Không thể cài đặt ${trimmed}: ${err?.message || err}`);
+      }
+    }
+  }
+
   const pyodide = await getPyodideInstance(onProgress);
   onProgress?.(`Đang tải và cài đặt ${trimmed}...`);
-  verifiedImportableModules.clear();
 
   try {
     if (PYODIDE_PREBUILT_PACKAGES.has(normalized)) {
@@ -1518,6 +1909,8 @@ async function ensureCodePackagesReady(
   code: string,
   onStatus?: (msg: string) => void
 ): Promise<void> {
+  if (!code.includes('import')) return;
+
   const importedModules = new Set<string>();
   const importRegex = /^\s*(?:import|from)\s+([a-zA-Z0-9_]+)/gm;
   let match: RegExpExecArray | null;
@@ -1528,6 +1921,15 @@ async function ensureCodePackagesReady(
   if (importedModules.size === 0) return;
 
   const savedEntries = getSavedUserPipPackages();
+  const sortedMods = Array.from(importedModules).sort();
+  const sigKey = `${sortedMods.join(',')}|${savedEntries.length}`;
+  if (verifiedImportSignatureCache.has(sigKey)) {
+    const cachedPkgs = verifiedImportSignatureCache.get(sigKey)!;
+    if (cachedPkgs.every((pkg) => isPyodidePackageLoaded(pyodide, pkg))) {
+      return;
+    }
+  }
+
   const savedMap = new Map(savedEntries.map((e) => [e.name, e]));
 
   const packagesToLoad = new Set<string>();
@@ -1572,7 +1974,19 @@ async function ensureCodePackagesReady(
     }
   }
 
-  if (packagesToLoad.size === 0) return;
+  if (packagesToLoad.size === 0) {
+    if (verifiedImportSignatureCache.size >= MAX_LOCAL_CACHE_ENTRIES) {
+      const firstKey = verifiedImportSignatureCache.keys().next().value;
+      if (firstKey) verifiedImportSignatureCache.delete(firstKey);
+    }
+    verifiedImportSignatureCache.set(
+      sigKey,
+      sortedMods
+        .map((m) => IMPORT_TO_PACKAGE_MAP[m] || IMPORT_TO_PACKAGE_MAP[m.toLowerCase()] || '')
+        .filter(Boolean)
+    );
+    return;
+  }
 
   const prebuiltBatch: string[] = [];
   const customList: string[] = [];
@@ -1604,6 +2018,39 @@ async function ensureCodePackagesReady(
   }
 }
 
+export async function checkPythonSyntaxWithPyodide(code: string): Promise<{
+  checked: boolean;
+  error?: string;
+}> {
+  if (!workerUnavailable && pyodideWorker && getPyodideWarmState() === 'ready') {
+    try {
+      const res = await callPyodideWorker<any>({ type: 'checkSyntax', code });
+      if (res?.supported) {
+        return res.ok ? { checked: true } : { checked: true, error: res.error };
+      }
+    } catch {}
+  }
+
+  const pyodide = typeof window !== 'undefined' ? window.pyodideInstance : undefined;
+  if (pyodide) {
+    try {
+      pyodide.globals.set('__apk_syntax_check', code);
+      pyodide.runPython(`
+import ast
+try:
+    ast.parse(__apk_syntax_check)
+finally:
+    del __apk_syntax_check
+`);
+      return { checked: true };
+    } catch (err: any) {
+      return { checked: true, error: String(err?.message || err || '') };
+    }
+  }
+
+  return { checked: false };
+}
+
 export async function runPyodideCode(options: PyodideRunOptions): Promise<{
   stdout: string;
   stderr: string;
@@ -1615,6 +2062,37 @@ export async function runPyodideCode(options: PyodideRunOptions): Promise<{
   prompt?: string;
 }> {
   const { code, inputs = [], signal, onStdout, onStderr, onStatus } = options;
+
+  if (signal?.aborted) {
+    throw new DOMException('Đã dừng thực thi.', 'AbortError');
+  }
+
+  // Prefer dedicated Web Worker for 60fps UI responsiveness & instant hard-cancel of infinite loops
+  if (!workerUnavailable) {
+    try {
+      const res = await callPyodideWorker<any>(
+        {
+          type: 'runCode',
+          code,
+          inputs,
+          savedPackages: getSavedPkgSnapshot(),
+        },
+        { signal, onStdout, onStderr, onStatus }
+      );
+      if (res?.type === 'runResult' && res.result) {
+        return res.result;
+      }
+    } catch (err: any) {
+      if (err?.name === 'AbortError' || signal?.aborted) {
+        throw err;
+      }
+      // Only fall back to main thread if Worker itself became unavailable
+      if (!workerUnavailable) {
+        throw err;
+      }
+    }
+  }
+
   const pyodide = await getPyodideInstance(onStatus);
 
   if (signal?.aborted) {
@@ -1623,10 +2101,17 @@ export async function runPyodideCode(options: PyodideRunOptions): Promise<{
 
   if (!runtimeBootstrapped) {
     await pyodide.runPythonAsync(CORE_BOOTSTRAP_SCRIPT);
+    cachedMainPyFns = {
+      runSync: pyodide.globals.get('_pydroid_run_sync'),
+      prepareAsync: pyodide.globals.get('_pydroid_prepare_io'),
+      finishAsync: pyodide.globals.get('_pydroid_finish_async'),
+      transformSleep: pyodide.globals.get('_pydroid_transform_sleep'),
+      flushIo: pyodide.globals.get('_pydroid_flush_io'),
+      getIoState: pyodide.globals.get('_pydroid_get_io_state'),
+    };
     runtimeBootstrapped = true;
   }
 
-  // Normalize multi-line buffered inputs into sequential line queue
   const normalizedInputs: string[] = [];
   for (const item of inputs) {
     if (typeof item === 'string') {
@@ -1636,18 +2121,65 @@ export async function runPyodideCode(options: PyodideRunOptions): Promise<{
       normalizedInputs.push(String(item));
     }
   }
+  const inputsJson = JSON.stringify(normalizedInputs);
 
-  let stdoutBuffer = '';
-  let stderrBuffer = '';
+  const stdoutChunks: string[] = [];
+  const stderrChunks: string[] = [];
+  let pendingStdout: string[] = [];
+  let lastEmitTs = 0;
 
-  window.__pydroid_tty_stdout = (chunk: string) => {
-    stdoutBuffer += chunk;
-    onStdout?.(chunk);
+  const flushFallbackStdout = () => {
+    if (pendingStdout.length === 0) return;
+    const joined = pendingStdout.join('');
+    pendingStdout = [];
+    lastEmitTs = performance.now();
+    onStdout?.(joined);
   };
 
-  window.__pydroid_tty_stderr = (chunk: string) => {
-    stderrBuffer += chunk;
+  const handleStdoutChunk = (chunk: string) => {
+    if (!chunk) return;
+    stdoutChunks.push(chunk);
+    pendingStdout.push(chunk);
+    const now = performance.now();
+    if (chunk.length >= 4096 || now - lastEmitTs >= 16) {
+      flushFallbackStdout();
+    }
+  };
+
+  const handleStderrChunk = (chunk: string) => {
+    if (!chunk) return;
+    stderrChunks.push(chunk);
     onStderr?.(chunk);
+  };
+
+  const cleanTracebackLines = (rawErr: string): string => {
+    const errLines = rawErr.split('\n');
+    const filteredLines: string[] = [];
+    let skippingInternal = false;
+    for (const line of errLines) {
+      if (
+        line.includes('_pyodide') ||
+        line.includes('eval_code_async') ||
+        line.includes('CodeRunner') ||
+        line.includes('_pydroid_run_sync')
+      ) {
+        skippingInternal = true;
+        continue;
+      }
+      if (
+        skippingInternal &&
+        (line.trim().startsWith('await ') ||
+          line.trim().startsWith('self.') ||
+          line.trim().startsWith('mod = ') ||
+          line.trim().startsWith('exec(code_obj') ||
+          line.trim().startsWith('^^^^'))
+      ) {
+        continue;
+      }
+      skippingInternal = false;
+      filteredLines.push(line.replace('File "<exec>"', 'File "main.py"'));
+    }
+    return filteredLines.join('\n').trim() || rawErr;
   };
 
   let emscriptenInputIdx = 0;
@@ -1666,18 +2198,13 @@ export async function runPyodideCode(options: PyodideRunOptions): Promise<{
   let plotImages: string[] = [];
 
   try {
-    // Fast per-run state reset
-    pyodide.runPython(`_pydroid_reset_io(${JSON.stringify(JSON.stringify(normalizedInputs))})`);
-
-    // Ensure any imported built-in or persisted pip packages are loaded cleanly
     await ensureCodePackagesReady(pyodide, code, onStatus);
 
     if (signal?.aborted) {
       throw new DOMException('Đã dừng thực thi.', 'AbortError');
     }
 
-    // Configure non-interactive Agg backend + non-blocking plt.show() when matplotlib is referenced
-    if (code.includes('matplotlib') || code.includes('plt')) {
+    if (!matplotlibConfigured && (code.includes('matplotlib') || code.includes('plt'))) {
       try {
         await pyodide.runPythonAsync(`
 try:
@@ -1688,25 +2215,93 @@ try:
 except Exception:
     pass
 `);
-      } catch {
-        // ignore if matplotlib fails to init
-      }
+        matplotlibConfigured = true;
+      } catch {}
     }
 
-    // Transform top-level time.sleep to non-blocking asyncio.sleep if code contains sleep
     let runnableCode = code;
-    if (code.includes('sleep')) {
-      try {
-        const transformed = pyodide.runPython(`_pydroid_transform_sleep(${JSON.stringify(code)})`);
-        if (transformed && typeof transformed === 'string') {
-          runnableCode = transformed;
+    if (/\b(?:time\.)?sleep\s*\(/.test(code)) {
+      const cachedTransformed = sleepTransformCache.get(code);
+      if (cachedTransformed !== undefined) {
+        runnableCode = cachedTransformed;
+      } else if (cachedMainPyFns?.transformSleep) {
+        try {
+          const transformed = cachedMainPyFns.transformSleep(code);
+          if (transformed && typeof transformed === 'string') {
+            runnableCode = transformed;
+            if (sleepTransformCache.size >= MAX_LOCAL_CACHE_ENTRIES) {
+              const firstKey = sleepTransformCache.keys().next().value;
+              if (firstKey) sleepTransformCache.delete(firstKey);
+            }
+            sleepTransformCache.set(code, transformed);
+          }
+        } catch {
+          runnableCode = code;
         }
-      } catch {
-        runnableCode = code;
       }
     }
 
-    // Execute user code in a fresh isolated module namespace
+    const capturePlots = code.includes('matplotlib') || code.includes('plt.');
+
+    // Fast Single-FFI Sync Execution Path (cached bytecode + zero JS exception overhead on input())
+    if (cachedMainPyFns?.runSync) {
+      const syncResJson: string = cachedMainPyFns.runSync(
+        runnableCode,
+        inputsJson,
+        handleStdoutChunk,
+        handleStderrChunk,
+        capturePlots
+      );
+      const syncRes = JSON.parse(syncResJson);
+
+      if (syncRes.status === 'ok') {
+        flushFallbackStdout();
+        return {
+          stdout: stdoutChunks.join(''),
+          stderr: stderrChunks.join(''),
+          exitCode: 0,
+          duration: Math.round(performance.now() - startTime),
+          engine: `Pyodide ${PYODIDE_VERSION} (WASM TTY Emulated)`,
+          plotImages: Array.isArray(syncRes.plots) ? syncRes.plots : [],
+          isWaitingInput: false,
+        };
+      }
+
+      if (syncRes.status === 'waiting_input') {
+        flushFallbackStdout();
+        return {
+          stdout: stdoutChunks.join(''),
+          stderr: '',
+          exitCode: 0,
+          duration: Math.round(performance.now() - startTime),
+          engine: `Pyodide ${PYODIDE_VERSION} (WASM TTY Emulated)`,
+          plotImages: [],
+          isWaitingInput: true,
+          prompt: syncRes.prompt || 'input():',
+        };
+      }
+
+      if (syncRes.status === 'error') {
+        flushFallbackStdout();
+        const cleanErr = cleanTracebackLines(String(syncRes.error || ''));
+        onStderr?.(cleanErr);
+        stderrChunks.push(cleanErr);
+        return {
+          stdout: stdoutChunks.join(''),
+          stderr: stderrChunks.join('\n'),
+          exitCode: 1,
+          duration: Math.round(performance.now() - startTime),
+          engine: `Pyodide ${PYODIDE_VERSION} (WASM TTY Emulated)`,
+          plotImages: [],
+          isWaitingInput: false,
+        };
+      }
+    }
+
+    if (cachedMainPyFns?.prepareAsync) {
+      cachedMainPyFns.prepareAsync(inputsJson, handleStdoutChunk, handleStderrChunk);
+    }
+
     const execNamespace = pyodide.toPy({ __name__: '__main__', __file__: 'main.py' });
     try {
       await pyodide.runPythonAsync(runnableCode, { globals: execNamespace });
@@ -1714,42 +2309,29 @@ except Exception:
       execNamespace.destroy?.();
     }
 
-    // Check for rendered matplotlib plots only if matplotlib was loaded
-    if (code.includes('matplotlib') || code.includes('plt.')) {
-      const plotCaptureScript = `
-import sys, json
-_captured_plots = []
-if 'matplotlib.pyplot' in sys.modules:
-    try:
-        import matplotlib.pyplot as plt
-        import io, base64
-        for fig_num in plt.get_fignums():
-            fig = plt.figure(fig_num)
-            buf = io.BytesIO()
-            fig.savefig(buf, format='png', bbox_inches='tight', dpi=120)
-            buf.seek(0)
-            _captured_plots.append(base64.b64encode(buf.read()).decode('utf-8'))
-            plt.close(fig)
-    except Exception:
-        pass
-json.dumps(_captured_plots)
-`;
-      const plotsJson = await pyodide.runPythonAsync(plotCaptureScript);
+    if (cachedMainPyFns?.finishAsync) {
+      const plotsJson: string = cachedMainPyFns.finishAsync(capturePlots);
       try {
         plotImages = JSON.parse(plotsJson);
       } catch {
         plotImages = [];
       }
     }
+    flushFallbackStdout();
   } catch (err: any) {
+    try {
+      cachedMainPyFns?.flushIo?.();
+    } catch {}
+    flushFallbackStdout();
+
     if (err?.name === 'AbortError') {
       exitCode = 130;
       const cancelMsg = 'Đã dừng thực thi bởi người dùng.';
-      stderrBuffer += (stderrBuffer ? '\n' : '') + cancelMsg;
+      stderrChunks.push(cancelMsg);
       onStderr?.(cancelMsg);
       return {
-        stdout: stdoutBuffer,
-        stderr: stderrBuffer,
+        stdout: stdoutChunks.join(''),
+        stderr: stderrChunks.join('\n'),
         exitCode,
         duration: Math.round(performance.now() - startTime),
         engine: `Pyodide ${PYODIDE_VERSION} (WASM TTY Emulated)`,
@@ -1758,21 +2340,17 @@ json.dumps(_captured_plots)
       };
     }
 
-    let isWaitingFromPython = false;
-    let pyStdout = '';
-    let pyPrompt = '';
+    let ioState: { waiting?: boolean; prompt?: string; stderrTail?: string } = {};
     try {
-      isWaitingFromPython = !!pyodide.runPython('_pydroid_is_waiting_input');
-      pyStdout = pyodide.runPython('"".join(_pydroid_stdout_buffer)');
-      pyPrompt = pyodide.runPython('_pydroid_last_prompt');
-    } catch {
-      // ignore
-    }
+      if (cachedMainPyFns?.getIoState) {
+        ioState = JSON.parse(cachedMainPyFns.getIoState());
+      }
+    } catch {}
 
     const errStr = String(err?.message || err || '');
     const errType = String(err?.type || '');
     const isWaiting =
-      isWaitingFromPython ||
+      !!ioState.waiting ||
       errType === '_PydroidWaitingInput' ||
       errType === 'EOFError' ||
       errStr.includes('_PydroidWaitingInput') ||
@@ -1781,69 +2359,33 @@ json.dumps(_captured_plots)
 
     if (isWaiting) {
       return {
-        stdout: pyStdout || stdoutBuffer,
+        stdout: stdoutChunks.join(''),
         stderr: '',
         exitCode: 0,
         duration: Math.round(performance.now() - startTime),
         engine: `Pyodide ${PYODIDE_VERSION} (WASM TTY Emulated)`,
         plotImages,
         isWaitingInput: true,
-        prompt: pyPrompt || 'input():',
+        prompt: ioState.prompt || 'input():',
       };
     }
 
     exitCode = 1;
     let cleanErr = errStr;
-    if (cleanErr === 'PythonError') {
-      try {
-        cleanErr = pyodide.runPython('"".join(_pydroid_stderr_buffer)') || errStr;
-      } catch {
-        // ignore
-      }
+    if (cleanErr === 'PythonError' && ioState.stderrTail) {
+      cleanErr = ioState.stderrTail;
     }
+    cleanErr = cleanTracebackLines(cleanErr);
 
-    // Clean up internal Pyodide runtime frames
-    const errLines = cleanErr.split('\n');
-    const filteredLines: string[] = [];
-    let skippingInternal = false;
-    for (const line of errLines) {
-      if (line.includes('_pyodide') || line.includes('eval_code_async') || line.includes('CodeRunner')) {
-        skippingInternal = true;
-        continue;
-      }
-      if (
-        skippingInternal &&
-        (line.trim().startsWith('await ') ||
-          line.trim().startsWith('self.') ||
-          line.trim().startsWith('mod = ') ||
-          line.trim().startsWith('^^^^'))
-      ) {
-        continue;
-      }
-      skippingInternal = false;
-      filteredLines.push(line.replace('File "<exec>"', 'File "main.py"'));
-    }
-    cleanErr = filteredLines.join('\n').trim() || errStr;
-
-    stderrBuffer += (stderrBuffer ? '\n' : '') + cleanErr;
+    stderrChunks.push(cleanErr);
     onStderr?.(cleanErr);
-  } finally {
-    delete window.__pydroid_tty_stdout;
-    delete window.__pydroid_tty_stderr;
-  }
-
-  let finalStdout = '';
-  try {
-    finalStdout = pyodide.runPython('"".join(_pydroid_stdout_buffer)');
-  } catch {
-    finalStdout = stdoutBuffer;
   }
 
   const duration = Math.round(performance.now() - startTime);
 
   return {
-    stdout: finalStdout || stdoutBuffer,
-    stderr: stderrBuffer,
+    stdout: stdoutChunks.join(''),
+    stderr: stderrChunks.join('\n'),
     exitCode,
     duration,
     engine: `Pyodide ${PYODIDE_VERSION} (WASM TTY Emulated)`,
