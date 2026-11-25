@@ -135,6 +135,24 @@ jobs:
                   `${storagePerms}\n\n    <application`
                 );
               }
+              if (!manifest.includes("android.permission.VIBRATE")) {
+                manifest = manifest.replace(
+                  /<application/,
+                  `    <uses-permission android:name="android.permission.VIBRATE" />\n    <application`
+                );
+              }
+              if (!manifest.includes("android:largeHeap")) {
+                manifest = manifest.replace(
+                  /<application\b/,
+                  "<application android:largeHeap=\"true\""
+                );
+              }
+              if (!manifest.includes("android:hardwareAccelerated")) {
+                manifest = manifest.replace(
+                  /<application\b/,
+                  "<application android:hardwareAccelerated=\"true\""
+                );
+              }
               fs.writeFileSync(manifestPath, manifest, "utf8");
             }
             const p = "android/app/src/main/res/values/styles.xml";
@@ -227,11 +245,15 @@ jobs:
               "",
               "    @PluginMethod",
               "    public void openDocument(PluginCall call) {",
-              "        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);",
-              "        intent.addCategory(Intent.CATEGORY_OPENABLE);",
-              "        intent.setType(\"*/*\");",
-              "        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);",
-              "        startActivityForResult(call, intent, \"handleOpenDocumentResult\");",
+              "        try {",
+              "            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);",
+              "            intent.addCategory(Intent.CATEGORY_OPENABLE);",
+              "            intent.setType(\"*/*\");",
+              "            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);",
+              "            startActivityForResult(call, intent, \"handleOpenDocumentResult\");",
+              "        } catch (Exception e) {",
+              "            call.reject(\"Không thể mở trình chọn tệp trên thiết bị: \" + e.getMessage(), e);",
+              "        }",
               "    }",
               "",
               "    @ActivityCallback",
@@ -305,14 +327,18 @@ jobs:
               "",
               "    @PluginMethod",
               "    public void createDocument(PluginCall call) {",
-              "        String fileName = call.getString(\"fileName\", \"main.py\");",
-              "        String mimeType = call.getString(\"mimeType\", \"text/plain\");",
-              "        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);",
-              "        intent.addCategory(Intent.CATEGORY_OPENABLE);",
-              "        intent.setType(mimeType);",
-              "        intent.putExtra(Intent.EXTRA_TITLE, fileName);",
-              "        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);",
-              "        startActivityForResult(call, intent, \"handleCreateDocumentResult\");",
+              "        try {",
+              "            String fileName = call.getString(\"fileName\", \"main.py\");",
+              "            String mimeType = call.getString(\"mimeType\", \"text/plain\");",
+              "            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);",
+              "            intent.addCategory(Intent.CATEGORY_OPENABLE);",
+              "            intent.setType(mimeType);",
+              "            intent.putExtra(Intent.EXTRA_TITLE, fileName);",
+              "            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);",
+              "            startActivityForResult(call, intent, \"handleCreateDocumentResult\");",
+              "        } catch (Exception e) {",
+              "            call.reject(\"Không thể mở hộp thoại lưu tệp: \" + e.getMessage(), e);",
+              "        }",
               "    }",
               "",
               "    @ActivityCallback",
@@ -363,20 +389,54 @@ jobs:
               const lines = [
                 "package org.pydroid3.web;",
                 "",
+                "import android.annotation.TargetApi;",
                 "import android.graphics.Color;",
+                "import android.os.Build;",
                 "import android.os.Bundle;",
                 "import android.view.View;",
+                "import android.view.ViewGroup;",
+                "import android.webkit.RenderProcessGoneDetail;",
+                "import android.webkit.WebView;",
                 "import androidx.core.graphics.Insets;",
                 "import androidx.core.view.ViewCompat;",
                 "import androidx.core.view.WindowCompat;",
                 "import androidx.core.view.WindowInsetsCompat;",
                 "import com.getcapacitor.BridgeActivity;",
+                "import com.getcapacitor.BridgeWebViewClient;",
                 "",
                 "public class MainActivity extends BridgeActivity {",
+                "    private static long lastRendererRecoverMs = 0L;",
+                "",
                 "    @Override",
                 "    protected void onCreate(Bundle savedInstanceState) {",
                 "        registerPlugin(NativeStoragePlugin.class);",
                 "        super.onCreate(savedInstanceState);",
+                "        if (getBridge() != null && getBridge().getWebView() != null) {",
+                "            getBridge().getWebView().setWebViewClient(new BridgeWebViewClient(getBridge()) {",
+                "                @Override",
+                "                @TargetApi(Build.VERSION_CODES.O)",
+                "                public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {",
+                "                    if (view != null) {",
+                "                        if (view.getParent() instanceof ViewGroup) {",
+                "                            ((ViewGroup) view.getParent()).removeView(view);",
+                "                        }",
+                "                        try {",
+                "                            view.destroy();",
+                "                        } catch (Exception ignored) {}",
+                "                    }",
+                "                    long now = System.currentTimeMillis();",
+                "                    if (now - lastRendererRecoverMs > 3000L && !isFinishing() && !isDestroyed()) {",
+                "                        lastRendererRecoverMs = now;",
+                "                        runOnUiThread(() -> {",
+                "                            try {",
+                "                                recreate();",
+                "                            } catch (Exception ignored) {}",
+                "                        });",
+                "                    }",
+                "                    return true;",
+                "                }",
+                "            });",
+                "        }",
                 "        WindowCompat.setDecorFitsSystemWindows(getWindow(), true);",
                 "        getWindow().setStatusBarColor(Color.parseColor(\"#070b14\"));",
                 "        getWindow().setNavigationBarColor(Color.parseColor(\"#070b14\"));",

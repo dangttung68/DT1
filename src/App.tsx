@@ -317,38 +317,42 @@ function MainIDEApp() {
     } catch (e) {}
   }, []);
 
+  const safeSetStorage = (key: string, value: string) => {
+    try {
+      localStorage.setItem(key, value);
+    } catch {}
+  };
+
   useEffect(() => {
-    localStorage.setItem('pydroid_files', JSON.stringify(files));
+    safeSetStorage('pydroid_files', JSON.stringify(files));
   }, [files]);
 
   useEffect(() => {
-    localStorage.setItem('pydroid_engine', engine);
+    safeSetStorage('pydroid_engine', engine);
   }, [engine]);
 
   useEffect(() => {
-    localStorage.setItem('pydroid_syntax_theme', JSON.stringify(syntaxTheme));
+    safeSetStorage('pydroid_syntax_theme', JSON.stringify(syntaxTheme));
   }, [syntaxTheme]);
 
   useEffect(() => {
-    localStorage.setItem('pydroid_terminal_theme', JSON.stringify(terminalTheme));
+    safeSetStorage('pydroid_terminal_theme', JSON.stringify(terminalTheme));
   }, [terminalTheme]);
 
   useEffect(() => {
-    try {
-      localStorage.setItem('pydroid_terminal_auto_clear', String(autoClearTerminalOnRun));
-    } catch {}
+    safeSetStorage('pydroid_terminal_auto_clear', String(autoClearTerminalOnRun));
   }, [autoClearTerminalOnRun]);
 
   useEffect(() => {
-    localStorage.setItem('pydroid_shortcuts', JSON.stringify(shortcuts));
+    safeSetStorage('pydroid_shortcuts', JSON.stringify(shortcuts));
   }, [shortcuts]);
 
   useEffect(() => {
-    localStorage.setItem('pydroid_keysize', keySize);
+    safeSetStorage('pydroid_keysize', keySize);
   }, [keySize]);
 
   useEffect(() => {
-    localStorage.setItem('pydroid_font_size', String(fontSize));
+    safeSetStorage('pydroid_font_size', String(fontSize));
   }, [fontSize]);
 
   useEffect(() => {
@@ -382,29 +386,30 @@ function MainIDEApp() {
 
   // Coordinated dual-engine warm-up & pre-caching of DEFAULT_MAIN_PY / active file dependencies
   useEffect(() => {
+    const isApk = isMobileOrApk();
     const useOfflinePyodide =
-      engine === 'pyodide' || (isMobileOrApk() && !hasCustomServer());
+      engine === 'pyodide' || (isApk && !hasCustomServer());
     const seedCode = activeFile?.content || DEFAULT_MAIN_PY;
 
-    // 1. Immediately warm the primary active engine after mount/switch (short 120ms settle delay)
+    // 1. Warm the primary active engine after mount/switch (let Android WebView settle UI & permissions first)
     const primaryTimer = setTimeout(() => {
       if (useOfflinePyodide) {
         prewarmPyodide(seedCode);
       } else {
         void prewarmCPythonServer();
       }
-    }, 120);
+    }, isApk ? 850 : 120);
 
     // 2. Lazily pre-cache/warm the secondary engine during idle time so switching engines is instantaneous
     const secondaryTimer = setTimeout(() => {
       if (useOfflinePyodide) {
-        if (!isMobileOrApk() || hasCustomServer()) {
+        if (!isApk || hasCustomServer()) {
           void prewarmCPythonServer();
         }
       } else {
         precachePyodideCoreAssets();
       }
-    }, 1800);
+    }, isApk ? 2600 : 1800);
 
     return () => {
       clearTimeout(primaryTimer);
@@ -770,30 +775,30 @@ function MainIDEApp() {
 
     if (backup.shortcutsConfig.shortcuts.length > 0) {
       setShortcuts(restoredShortcuts);
-      localStorage.setItem('pydroid_shortcuts', JSON.stringify(restoredShortcuts));
+      safeSetStorage('pydroid_shortcuts', JSON.stringify(restoredShortcuts));
     }
 
     setKeySize(backup.shortcutsConfig.keySize);
-    localStorage.setItem('pydroid_keysize', backup.shortcutsConfig.keySize);
+    safeSetStorage('pydroid_keysize', backup.shortcutsConfig.keySize);
 
     if (backup.shortcutsConfig.userProfileShortcuts?.length) {
-      localStorage.setItem(
+      safeSetStorage(
         'pydroid_user_shortcuts',
         JSON.stringify(backup.shortcutsConfig.userProfileShortcuts)
       );
     }
 
     setSyntaxTheme(backup.syntaxTheme);
-    localStorage.setItem('pydroid_syntax_theme', JSON.stringify(backup.syntaxTheme));
+    safeSetStorage('pydroid_syntax_theme', JSON.stringify(backup.syntaxTheme));
 
     if (backup.terminalTheme) {
       const normalizedTerm = normalizeTerminalTheme(backup.terminalTheme);
       setTerminalTheme(normalizedTerm);
-      localStorage.setItem('pydroid_terminal_theme', JSON.stringify(normalizedTerm));
+      safeSetStorage('pydroid_terminal_theme', JSON.stringify(normalizedTerm));
     }
 
     setFontSize(backup.editorSettings.fontSize);
-    localStorage.setItem('pydroid_font_size', String(backup.editorSettings.fontSize));
+    safeSetStorage('pydroid_font_size', String(backup.editorSettings.fontSize));
 
     if (backup.editorSettings.defaultFolder) {
       setDefaultFolderPath(backup.editorSettings.defaultFolder);

@@ -39,7 +39,7 @@ const IDB_BUNDLES_STORE = 'package_bundles';
 const IDB_ASSETS_STORE = 'cdn_assets';
 const IDB_VERSION = 2;
 const MAX_CDN_CACHE_BYTES = 180 * 1024 * 1024;
-const MAX_RAM_ASSET_BYTES = 2 * 1024 * 1024; // Only keep small metadata/scripts in RAM; read large WASM/wheels from IDB
+const MAX_RAM_ASSET_BYTES = 512 * 1024; // Only keep small manifests/scripts in RAM; never duplicate large WASM/wheels in WebView heap
 
 const IMPORT_TO_PACKAGE_MAP: Record<string, string> = {
   numpy: 'numpy',
@@ -219,59 +219,45 @@ async function evictOldestCdnAssetsIfNeeded(db: IDBDatabase, bytesToFree: number
   } catch {}
 }
 
-async function putCdnAssetToIDB(asset: CachedCdnAsset): Promise<void> {
+let cdnIdbWriteQueue: Promise<void> = Promise.resolve();
+
+function putCdnAssetToIDB(asset: CachedCdnAsset): Promise<void> {
   if (!asset.data || asset.data.byteLength === 0 || asset.data.byteLength > 45 * 1024 * 1024) {
-    return;
+    return Promise.resolve();
   }
 
   if (asset.size <= MAX_RAM_ASSET_BYTES) {
     memoryAssetCache.set(asset.url, asset);
   }
 
-  try {
-    const db = await getPipDB();
+  // Serialize IDB writes so concurrent asset fetches never spike Android WebView memory
+  const nextWrite = cdnIdbWriteQueue.then(async () => {
     try {
-      const allAssetsMeta = await new Promise<Array<{ size: number }>>((resolve) => {
-        const tx = db.transaction(IDB_ASSETS_STORE, 'readonly');
-        const list: Array<{ size: number }> = [];
-        const req = tx.objectStore(IDB_ASSETS_STORE).openCursor();
-        req.onsuccess = () => {
-          const cursor = req.result;
-          if (!cursor) {
-            resolve(list);
-            return;
-          }
-          list.push({ size: (cursor.value as CachedCdnAsset).size || 0 });
-          cursor.continue();
-        };
-        req.onerror = () => resolve([]);
+      const db = await getPipDB();
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(IDB_ASSETS_STORE, 'readwrite');
+        tx.objectStore(IDB_ASSETS_STORE).put(asset);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
       });
-      const totalBytes = allAssetsMeta.reduce((sum, item) => sum + item.size, 0);
-      if (totalBytes + asset.size > MAX_CDN_CACHE_BYTES) {
-        await evictOldestCdnAssetsIfNeeded(db, totalBytes + asset.size - MAX_CDN_CACHE_BYTES);
+    } catch (err: any) {
+      if (err?.name === 'QuotaExceededError') {
+        try {
+          const db = await getPipDB();
+          await evictOldestCdnAssetsIfNeeded(db, Math.max(asset.size * 2, 20 * 1024 * 1024));
+          await new Promise<void>((resolve, reject) => {
+            const tx = db.transaction(IDB_ASSETS_STORE, 'readwrite');
+            tx.objectStore(IDB_ASSETS_STORE).put(asset);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+          });
+        } catch {}
       }
-    } catch {}
-
-    await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(IDB_ASSETS_STORE, 'readwrite');
-      tx.objectStore(IDB_ASSETS_STORE).put(asset);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-    });
-  } catch (err: any) {
-    if (err?.name === 'QuotaExceededError') {
-      try {
-        const db = await getPipDB();
-        await evictOldestCdnAssetsIfNeeded(db, Math.max(asset.size * 2, 20 * 1024 * 1024));
-        await new Promise<void>((resolve, reject) => {
-          const tx = db.transaction(IDB_ASSETS_STORE, 'readwrite');
-          tx.objectStore(IDB_ASSETS_STORE).put(asset);
-          tx.oncomplete = () => resolve();
-          tx.onerror = () => reject(tx.error);
-        });
-      } catch {}
     }
-  }
+  });
+
+  cdnIdbWriteQueue = nextWrite.catch(() => {});
+  return nextWrite;
 }
 
 async function fetchAndCachePyodideAsset(url: string): Promise<CachedCdnAsset | null> {
@@ -1013,8 +999,6 @@ async function ensurePyodideReady(
 
   pyodideInitPromise = (async () => {
     try {
-      const preloadedBundlesPromise = preloadCachedPackagesFromIDB();
-
       onStatus?.('Đang nạp nhân Python 3.12 WebAssembly...');
       await loadPyodideScriptInWorker();
 
@@ -1029,7 +1013,7 @@ async function ensurePyodideReady(
       if (!sitePackagesRestored) {
         sitePackagesRestored = true;
         try {
-          const preloaded = await preloadedBundlesPromise;
+          const preloaded = await preloadCachedPackagesFromIDB();
           writeCachedPackagesToPyodideFS(pyodide, preloaded);
         } catch {}
       }

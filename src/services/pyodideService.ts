@@ -89,7 +89,7 @@ const PYODIDE_PREBUILT_PACKAGES = new Set<string>([
 
 export type PyodideWarmState = 'idle' | 'warming' | 'ready' | 'error';
 
-const MAX_RAM_ASSET_BYTES = 2 * 1024 * 1024; // Keep small manifests/scripts in RAM; avoid duplicating large WASM/wheels in heap
+const MAX_RAM_ASSET_BYTES = 512 * 1024; // Keep small manifests/scripts in RAM; avoid duplicating large WASM/wheels in heap
 
 let pyodideLoadingPromise: Promise<any> | null = null;
 let runtimeBootstrapped = false;
@@ -590,68 +590,47 @@ async function evictOldestCdnAssetsIfNeeded(db: IDBDatabase, bytesToFree: number
   }
 }
 
-async function putCdnAssetToIDB(asset: CachedCdnAsset): Promise<void> {
+let cdnIdbWriteQueue: Promise<void> = Promise.resolve();
+
+function putCdnAssetToIDB(asset: CachedCdnAsset): Promise<void> {
   if (!asset.data || asset.data.byteLength === 0 || asset.data.byteLength > 45 * 1024 * 1024) {
-    return;
+    return Promise.resolve();
   }
 
   if (asset.size <= MAX_RAM_ASSET_BYTES) {
     memoryAssetCache.set(asset.url, asset);
   }
 
-  try {
-    const db = await getPipDB();
-
-    // Check total cached asset bytes softly and prune old optional wheels if above threshold
+  const nextWrite = cdnIdbWriteQueue.then(async () => {
     try {
-      const allAssetsMeta = await new Promise<Array<{ size: number }>>((resolve) => {
-        const tx = db.transaction(IDB_ASSETS_STORE, 'readonly');
-        const store = tx.objectStore(IDB_ASSETS_STORE);
-        const list: Array<{ size: number }> = [];
-        const req = store.openCursor();
-        req.onsuccess = () => {
-          const cursor = req.result;
-          if (!cursor) {
-            resolve(list);
-            return;
-          }
-          const val = cursor.value as CachedCdnAsset;
-          list.push({ size: val.size || 0 });
-          cursor.continue();
-        };
-        req.onerror = () => resolve([]);
+      const db = await getPipDB();
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(IDB_ASSETS_STORE, 'readwrite');
+        tx.objectStore(IDB_ASSETS_STORE).put(asset);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
       });
-      const totalBytes = allAssetsMeta.reduce((sum, item) => sum + item.size, 0);
-      if (totalBytes + asset.size > MAX_CDN_CACHE_BYTES) {
-        await evictOldestCdnAssetsIfNeeded(db, totalBytes + asset.size - MAX_CDN_CACHE_BYTES);
+    } catch (err: any) {
+      // Retry once after evicting if browser quota was exceeded
+      if (err?.name === 'QuotaExceededError') {
+        try {
+          const db = await getPipDB();
+          await evictOldestCdnAssetsIfNeeded(db, Math.max(asset.size * 2, 20 * 1024 * 1024));
+          await new Promise<void>((resolve, reject) => {
+            const tx = db.transaction(IDB_ASSETS_STORE, 'readwrite');
+            tx.objectStore(IDB_ASSETS_STORE).put(asset);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+          });
+        } catch {
+          // graceful degradation if device storage is full
+        }
       }
-    } catch {
-      // ignore size check errors
     }
+  });
 
-    await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(IDB_ASSETS_STORE, 'readwrite');
-      tx.objectStore(IDB_ASSETS_STORE).put(asset);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-    });
-  } catch (err: any) {
-    // Retry once after evicting if browser quota was exceeded
-    if (err?.name === 'QuotaExceededError') {
-      try {
-        const db = await getPipDB();
-        await evictOldestCdnAssetsIfNeeded(db, Math.max(asset.size * 2, 20 * 1024 * 1024));
-        await new Promise<void>((resolve, reject) => {
-          const tx = db.transaction(IDB_ASSETS_STORE, 'readwrite');
-          tx.objectStore(IDB_ASSETS_STORE).put(asset);
-          tx.oncomplete = () => resolve();
-          tx.onerror = () => reject(tx.error);
-        });
-      } catch {
-        // graceful degradation if device storage is full
-      }
-    }
-  }
+  cdnIdbWriteQueue = nextWrite.catch(() => {});
+  return nextWrite;
 }
 
 async function fetchAndCachePyodideAsset(
