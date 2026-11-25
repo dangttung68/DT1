@@ -1601,6 +1601,7 @@ export function precachePyodideCoreAssets(): void {
 
   const coreUrls = [
     PYODIDE_SCRIPT_URL,
+    `${PYODIDE_CDN_BASE}pyodide.mjs`,
     `${PYODIDE_CDN_BASE}pyodide-lock.json`,
     `${PYODIDE_CDN_BASE}pyodide.asm.js`,
     `${PYODIDE_CDN_BASE}python_stdlib.zip`,
@@ -1757,16 +1758,16 @@ export function prewarmPyodide(initialCode?: string): void {
       .then((res: any) => {
         if (res?.ok) {
           setPyodideWarmState('ready');
-        } else if (workerUnavailable) {
-          prewarmPyodide(initialCode);
         } else {
-          setPyodideWarmState('error');
+          workerUnavailable = true;
+          terminatePyodideWorker(new Error(res?.error || 'Worker init failed'));
+          prewarmPyodide(initialCode);
         }
       })
       .catch(() => {
-        if (workerUnavailable) {
-          prewarmPyodide(initialCode);
-        }
+        workerUnavailable = true;
+        terminatePyodideWorker(new Error('Worker init failed'));
+        prewarmPyodide(initialCode);
       });
     return;
   }
@@ -2079,7 +2080,11 @@ export async function runPyodideCode(options: PyodideRunOptions): Promise<{
         },
         { signal, onStdout, onStderr, onStatus }
       );
-      if (res?.type === 'runResult' && res.result) {
+      if (res?.type === 'runResult' && res.workerBootFailed) {
+        console.warn('Pyodide Worker boot failed, falling back to main thread:', res.error);
+        workerUnavailable = true;
+        terminatePyodideWorker(new Error(res.error || 'Worker boot failed'));
+      } else if (res?.type === 'runResult' && res.result) {
         return res.result;
       }
     } catch (err: any) {
